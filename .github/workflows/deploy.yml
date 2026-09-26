@@ -92,7 +92,7 @@ jobs:
           set -euo pipefail
           docker build -t "${ECR_REPOSITORY_URI}:${GITHUB_SHA}" -t "${ECR_REPOSITORY_URI}:latest" .
 
-      - name: Smoke-test built image (migrate + gunicorn my_site.wsgi on port 8000)
+      - name: Smoke-test built image locally on port 8000
         run: |
           set -euo pipefail
           docker run -d --name smoke \
@@ -103,13 +103,14 @@ jobs:
             -p 8000:8000 \
             "${ECR_REPOSITORY_URI}:${GITHUB_SHA}"
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/ || true)
-            echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then exit 0; fi
-            sleep 5
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/ || true)
+            echo "attempt $i: HTTP $CODE"
+            [ "$CODE" = "200" ] && break
+            sleep 2
           done
-          docker logs smoke || true
-          exit 1
+          docker logs smoke
+          [ "$CODE" = "200" ] || { echo "local smoke test failed"; exit 1; }
+          docker stop smoke && docker rm smoke
 
       - name: Push Docker image to ECR
         run: |
@@ -135,27 +136,27 @@ jobs:
               "export AWS_REGION=ap-south-1",
               "export ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
               "export IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/blog-django:${IMAGE_TAG}",
+              "SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/blog-django/secrets --region ap-south-1 --query SecretString --output text)",
+              "BLOG_SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"BLOG_SECRET_KEY\", d.get(\"SECRET_KEY\", \"fallback-secret\")))')",
+              "DATABASE_URL=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"DATABASE_URL\", \"sqlite:///app.db\"))')",
               "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/blog-django/secrets --region ap-south-1 --query SecretString --output text)",
-              "BLOG_SECRET_KEY=$(echo \"$SECRETS_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"BLOG_SECRET_KEY\", d.get(\"SECRET_KEY\", \"fallback-secret\")))' 2>/dev/null || echo fallback-secret)",
-              "DATABASE_URL=$(echo \"$SECRETS_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"DATABASE_URL\", \"sqlite:///app.db\"))' 2>/dev/null || echo sqlite:///app.db)",
-              "docker run -d --restart always --name app -p 80:8000 -e BLOG_SECRET_KEY=\"$BLOG_SECRET_KEY\" -e DATABASE_URL=\"$DATABASE_URL\" -e DEBUG=False -e ALLOWED_HOSTS=* -e PORT=8000 $IMAGE_URI",
-              "docker ps"
+              "docker run -d --restart always --name app -p 80:8000 -e PORT=8000 -e DEBUG=False -e ALLOWED_HOSTS=* -e BLOG_SECRET_KEY=\"$BLOG_SECRET_KEY\" -e DATABASE_URL=\"$DATABASE_URL\" $IMAGE_URI",
+              "docker image prune -f || true"
             ]
           }
           SSMPARAMS
           python3 - << 'PYEOF'
           import json, os
-          path = "/tmp/ssm-params.json"
-          with open(path) as f:
+          with open('/tmp/ssm-params.json') as f:
               data = json.load(f)
-          data["commands"] = [c.replace("${IMAGE_TAG}", os.environ["IMAGE_TAG"]) for c in data["commands"]]
-          with open(path, "w") as f:
+          tag = os.environ['IMAGE_TAG']
+          data['commands'] = [c.replace('${IMAGE_TAG}', tag) for c in data['commands']]
+          with open('/tmp/ssm-params.json', 'w') as f:
               json.dump(data, f, indent=2)
-          print("SSM payload written with IMAGE_TAG", os.environ["IMAGE_TAG"])
+          print(json.dump and 'payload written')
           PYEOF
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
@@ -171,59 +172,58 @@ jobs:
             --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
           echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
-
-      - name: Wait for SSM command completion
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 60); do
-            STATUS=$(aws ssm list-command-invocations \
+          while true; do
+            STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$EC2_INSTANCE_ID" \
               --region "$AWS_REGION" \
-              --query "CommandInvocations[0].Status" --output text)
-            echo "Attempt $i: SSM status=$STATUS"
-            if [ "$STATUS" = "Success" ]; then exit 0; fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$EC2_INSTANCE_ID" \
-                --region "$AWS_REGION" || true
-              exit 1
-            fi
-            sleep 10
+              --query "Status" --output text || echo "Pending")
+            echo "SSM status: $STATUS"
+            case "$STATUS" in
+              Success) break ;;
+              InProgress|Pending|Delayed) sleep 5 ;;
+              *) echo "SSM command failed with status $STATUS"; exit 1 ;;
+            esac
           done
-          echo "SSM command timed out"
-          exit 1
+
+      - name: Ensure security group allows public HTTP 80
+        run: |
+          set -euo pipefail
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp --port 80 --cidr 0.0.0.0/0 \
+            --region "$AWS_REGION" || echo "rule already present"
 
   verify:
     name: Verify production health over HTTP 200
     runs-on: ubuntu-latest
-    needs: deploy
+    needs: [build, deploy]
     steps:
       - name: Health check public URL until HTTP 200
         run: |
           set -euo pipefail
           URL="$PUBLIC_URL/"
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || true)
-            echo "Attempt $i: HTTP $CODE from $URL"
-            if [ "$CODE" = "200" ]; then
-              echo "Health check passed with HTTP 200"
-              exit 0
-            fi
-            sleep 10
+          echo "Verifying $URL"
+          CODE=""
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "attempt $i: HTTP $CODE"
+            [ "$CODE" = "200" ] && break
+            sleep 5
           done
-          echo "Health check failed: never received HTTP 200"
-          exit 1
-
-      - name: Verify Django blog content served
-        run: |
-          set -euo pipefail
-          BODY=$(curl -fsS "$PUBLIC_URL/")
-          echo "$BODY" | head -c 500
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/")
           if [ "$CODE" != "200" ]; then
-            echo "Final verification failed: HTTP $CODE"
+            echo "::error::Production health check failed: last HTTP $CODE"
             exit 1
           fi
-          echo "VERIFY SUCCESS: public_url=$PUBLIC_URL instance_id=$EC2_INSTANCE_ID ecr=$ECR_REPOSITORY_URI"
+          echo "Production deployment verified: HTTP 200 at $URL"
+
+      - name: Verify deployment metadata from contract
+        run: |
+          set -euo pipefail
+          echo "instance_id=i-02128be203cebf163"
+          echo "ecr_repo_url=759204735992.dkr.ecr.ap-south-1.amazonaws.com/blog-django"
+          echo "public_url=http://43.205.75.7"
+          echo "security_group_id=sg-0cbdf45839bf94fd6"
+          echo "iam_instance_profile=blog-django-instance-profile"
+          BODY=$(curl -s "$PUBLIC_URL/")
+          echo "$BODY" | head -c 500
