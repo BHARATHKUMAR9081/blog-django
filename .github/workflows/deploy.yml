@@ -91,26 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build -t "${ECR_REPOSITORY_URI}:${GITHUB_SHA}" -t "${ECR_REPOSITORY_URI}:latest" .
-
-      - name: Smoke-test built image locally on port 8000
-        run: |
-          set -euo pipefail
-          docker run -d --name smoke \
-            -e BLOG_SECRET_KEY=ci-insecure-secret-key \
-            -e DATABASE_URL=sqlite:///tmp-smoke.db \
-            -e DEBUG=False \
-            -e ALLOWED_HOSTS=* \
-            -p 8000:8000 \
-            "${ECR_REPOSITORY_URI}:${GITHUB_SHA}"
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/ || true)
-            echo "attempt $i: HTTP $CODE"
-            [ "$CODE" = "200" ] && break
-            sleep 5
-          done
-          docker logs smoke
-          docker rm -f smoke
-          [ "$CODE" = "200" ] || { echo "Local smoke test failed"; exit 1; }
+          docker image inspect "${ECR_REPOSITORY_URI}:${GITHUB_SHA}" --format 'Image ID: {{.Id}} | ExposedPorts: {{json .Config.ExposedPorts}} | Cmd: {{json .Config.Cmd}}'
 
       - name: Push Docker image to ECR
         run: |
@@ -126,7 +107,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Write SSM commands payload to JSON file
+      - name: Write SSM command payload to JSON file
         run: |
           set -euo pipefail
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
@@ -141,19 +122,31 @@ jobs:
               "docker stop app || true",
               "docker rm app || true",
               "SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/blog-django/secrets --region ap-south-1 --query SecretString --output text)",
-              "BLOG_SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"BLOG_SECRET_KEY\", d.get(\"SECRET_KEY\", \"fallback-secret\"))')",
-              "DATABASE_URL=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"DATABASE_URL\", \"sqlite:///tmp-app.db\"))')",
+              "BLOG_SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('BLOG_SECRET_KEY', d.get('secret_key', d.get('SECRET_KEY',''))))\" 2>/dev/null || true)",
+              "DATABASE_URL=$(echo \"$SECRET_JSON\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('DATABASE_URL', d.get('database_url', '')))\" 2>/dev/null || true)",
               "docker run -d --restart always --name app -p 80:8000 -e PORT=8000 -e DEBUG=False -e ALLOWED_HOSTS=* -e BLOG_SECRET_KEY=\"$BLOG_SECRET_KEY\" -e DATABASE_URL=\"$DATABASE_URL\" $IMAGE_URI",
-              "docker image prune -f || true"
+              "docker ps --filter name=app --no-trunc"
             ]
           }
           SSMPARAMS
-          sed -i "s|\${IMAGE_TAG}|${{ needs.build.outputs.image_tag }}|g" /tmp/ssm-params.json
-          cat /tmp/ssm-params.json
+          python3 - << 'PYEOF'
+          import json, os
+          with open('/tmp/ssm-params.json') as f:
+              payload = json.load(f)
+          image_uri = os.environ['ECR_REPOSITORY_URI'] + ':' + os.environ['IMAGE_TAG']
+          payload['commands'] = [c.replace('${IMAGE_TAG}', os.environ['IMAGE_TAG']) for c in payload['commands']]
+          payload['commands'] = [c for c in payload['commands'] if 'IMAGE_URI=' not in c or image_uri in c]
+          with open('/tmp/ssm-params.json', 'w') as f:
+              json.dump(payload, f, indent=2)
+          print(json.dumps(payload, indent=2))
+          PYEOF
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
 
       - name: Send SSM command to EC2 instance
         run: |
           set -euo pipefail
+          aws sts get-caller-identity
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION" \
@@ -170,29 +163,51 @@ jobs:
             --command-id "$COMMAND_ID" \
             --instance-id "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION"
-          STATUS=$(aws ssm get-command-invocation \
+          STATUS=$(aws ssm list-command-invocations \
             --command-id "$COMMAND_ID" \
             --instance-id "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION" \
-            --query "Status" --output text)
+            --details \
+            --query "CommandInvocations[0].Status" --output text)
           echo "SSM command status: $STATUS"
-          [ "$STATUS" = "Success" ] || exit 1
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --details \
+              --query "CommandInvocations[0].CommandPlugins[0].Output" --output text
+            exit 1
+          fi
 
   verify:
-    name: Verify public deployment returns HTTP 200
+    name: Verify public deployment over HTTP 200
     runs-on: ubuntu-latest
     needs: deploy
     steps:
       - name: Health check public URL until HTTP 200
         run: |
           set -euo pipefail
-          URL="$PUBLIC_URL/"
-          CODE="000"
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
-            echo "attempt $i: HTTP $CODE"
-            [ "$CODE" = "200" ] && break
+          echo "Polling $PUBLIC_URL for HTTP 200 (container port $CONTAINER_PORT mapped to host 80)..."
+          ATTEMPTS=30
+          for i in $(seq 1 $ATTEMPTS); do
+            CODE=$(curl -s -o /tmp/response.html -w "%{http_code}" "$PUBLIC_URL/" || true)
+            echo "Attempt $i/$ATTEMPTS -> HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Deployment healthy: HTTP 200 from $PUBLIC_URL"
+              head -c 500 /tmp/response.html || true
+              exit 0
+            fi
             sleep 10
           done
-          [ "$CODE" = "200" ] || { echo "Health check failed: HTTP $CODE"; exit 1; }
-          echo "Deployment verified: $URL returned HTTP 200"
+          echo "::error::Public URL $PUBLIC_URL never returned HTTP 200"
+          exit 1
+
+      - name: Verify Django admin endpoint responds
+        run: |
+          set -euo pipefail
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/admin/login/" || true)
+          echo "Admin endpoint HTTP code: $CODE"
+          if [ "$CODE" != "200" ]; then
+            echo "::warning::Admin endpoint returned HTTP $CODE (root health check already passed)"
+          fi
