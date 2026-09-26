@@ -11,7 +11,10 @@ https://docs.djangoproject.com/en/3.0/ref/settings/
 """
 
 import os
-import django_heroku
+try:
+    import django_heroku
+except ImportError:
+    django_heroku = None
 
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -129,4 +132,5 @@ LOGIN_REDIRECT_URL = '/'
 MEDIA_URL = 'media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-django_heroku.settings(locals(), allowed_hosts=False, secret_key=False)
+if django_heroku:
+    django_heroku.settings(locals(), allowed_hosts=False, secret_key=False)
