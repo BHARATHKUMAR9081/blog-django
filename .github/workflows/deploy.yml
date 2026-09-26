@@ -103,14 +103,14 @@ jobs:
           # Dynamic resolution: if INSTANCE_ID missing or stopped, locate active instance by tag
           if [ -z "$INSTANCE_ID" ] || ! aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
             echo "==> Resolving active EC2 instance by tag Name=$SERVER_NAME..."
-            RESOLVED_ID=$(aws ec2 describe-instances --region "$AWS_REGION" \
+            RESOLVED=$(aws ec2 describe-instances --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=$SERVER_NAME" "Name=instance-state-name,Values=running" \
               --query "Reservations[0].Instances[0].InstanceId" --output text)
-            if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
-              INSTANCE_ID="$RESOLVED_ID"
+            if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "None" ]; then
+              INSTANCE_ID="$RESOLVED"
               echo "==> Resolved instance: $INSTANCE_ID"
             else
-              echo "ERROR: No running EC2 instance found (INSTANCE_ID empty and tag lookup failed)." >&2
+              echo "ERROR: No running EC2 instance found for INSTANCE_ID=$INSTANCE_ID or tag Name=$SERVER_NAME" >&2
               exit 1
             fi
           else
@@ -125,13 +125,10 @@ jobs:
               "docker pull $FULL_IMAGE",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always --name app -p $HOST_PORT:$TARGET_PORT --env DJANGO_SETTINGS_MODULE=my_site.settings -e PORT=$TARGET_PORT $FULL_IMAGE"
+              "docker run -d --restart always --name app -p $HOST_PORT:$TARGET_PORT $FULL_IMAGE"
             ]
           }
           SSMPARAMS
-
-          echo "==> SSM command payload:"
-          cat /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
@@ -140,46 +137,49 @@ jobs:
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
-          echo "SSM_COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
 
-      - name: Wait for SSM command completion
-        run: |
-          set -e
-          echo "==> Waiting for SSM command $SSM_COMMAND_ID on $INSTANCE_ID"
-          aws ssm wait command-executed \
-            --command-id "$SSM_COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION"
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$SSM_COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "Status" --output text)
-          echo "SSM command status: $STATUS"
+          # Wait for SSM command completion
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query "CommandInvocations[0].Status" --output text)
+            echo "SSM status: $STATUS"
+            case "$STATUS" in
+              Success) echo "==> SSM deploy command succeeded"; break ;;
+              Failed|Cancelled|TimedOut) echo "ERROR: SSM command $STATUS" >&2; exit 1 ;;
+            esac
+            sleep 10
+          done
           if [ "$STATUS" != "Success" ]; then
-            echo "ERROR: remote deploy command failed with status $STATUS" >&2
-            aws ssm get-command-invocation \
-              --command-id "$SSM_COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "StandardErrorContent" --output text || true
+            echo "ERROR: SSM command did not complete in time (last status: $STATUS)" >&2
             exit 1
           fi
 
-      - name: Verify deployment - HTTP 200 health check
+      - name: Verify deployment health over HTTP
         run: |
           set -e
-          echo "==> Polling $PUBLIC_URL for HTTP 200"
-          ATTEMPTS=30
-          DELAY=5
-          for i in $(seq 1 $ATTEMPTS); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL" || true)
-            echo "Attempt $i/$ATTEMPTS: HTTP $CODE"
+          echo "Waiting for app to become healthy at $PUBLIC_URL ..."
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /tmp/health.body -w "%{http_code}" "$PUBLIC_URL/" || true)
+            echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
               echo "==> Health check passed (HTTP 200)"
               exit 0
             fi
-            sleep $DELAY
+            sleep 10
           done
-          echo "ERROR: health check never returned HTTP 200" >&2
+          echo "ERROR: Health check failed; last HTTP code: $CODE" >&2
+          cat /tmp/health.body || true
           exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "## Deployment Summary"
+            echo "- Service: EC2_DOCKER"
+            echo "- Region: $AWS_REGION"
+            echo "- Instance: $INSTANCE_ID ($SERVER_NAME)"
+            echo "- Image: $ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+            echo "- Public URL: $PUBLIC_URL (host port $HOST_PORT -> container port $TARGET_PORT)"
+          } >> "$GITHUB_STEP_SUMMARY"
