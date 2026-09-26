@@ -103,32 +103,33 @@ jobs:
           # Dynamic resolution: if INSTANCE_ID missing or stopped, locate active instance by tag
           if [ -z "$INSTANCE_ID" ] || ! aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
             echo "==> Resolving active EC2 instance by tag Name=$SERVER_NAME..."
-            RESOLVED_ID=$(aws ec2 describe-instances --region "$AWS_REGION" \
+            RESOLVED=$(aws ec2 describe-instances --region "$AWS_REGION" \
               --filters "Name=tag:Name,Values=$SERVER_NAME" "Name=instance-state-name,Values=running" \
               --query "Reservations[0].Instances[0].InstanceId" --output text)
-            if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
-              INSTANCE_ID="$RESOLVED_ID"
+            if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "None" ]; then
+              INSTANCE_ID="$RESOLVED"
               echo "==> Resolved instance: $INSTANCE_ID"
             else
-              echo "ERROR: No running EC2 instance found for INSTANCE_ID or tag Name=$SERVER_NAME" >&2
+              echo "ERROR: No running EC2 instance found for INSTANCE_ID=$INSTANCE_ID or tag Name=$SERVER_NAME" >&2
               exit 1
             fi
           else
-            echo "==> Using configured instance: $INSTANCE_ID"
+            echo "==> Using pinned instance: $INSTANCE_ID"
           fi
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
 
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -e",
-              "REGION=$AWS_REGION",
-              "ECR_REGISTRY=$ECR_REGISTRY",
-              "IMAGE_URI=$FULL_IMAGE",
+              "REGION=ap-south-1",
+              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/blog-django:latest",
               "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p $HOST_PORT:$TARGET_PORT --name app $IMAGE_URI"
+              "docker run -d --restart always --name app -p 80:8000 -e PORT=8000 -e DJANGO_SETTINGS_MODULE=my_site.settings $IMAGE_URI"
             ]
           }
           SSMPARAMS
@@ -140,106 +141,51 @@ jobs:
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
 
       - name: Wait for SSM command completion
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           set -e
-          ECR_REGISTRY="${ECR_REGISTRY:-759204735992.dkr.ecr.ap-south-1.amazonaws.com}"
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
-
-          if [ -z "$INSTANCE_ID" ] || ! aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
-            RESOLVED_ID=$(aws ec2 describe-instances --region "$AWS_REGION" \
-              --filters "Name=tag:Name,Values=$SERVER_NAME" "Name=instance-state-name,Values=running" \
-              --query "Reservations[0].Instances[0].InstanceId" --output text)
-            if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
-              INSTANCE_ID="$RESOLVED_ID"
-            else
-              echo "ERROR: No running EC2 instance found for tag Name=$SERVER_NAME" >&2
-              exit 1
-            fi
-          fi
-
-          cat > /tmp/ssm-params.json << SSMPARAMS
-          {
-            "commands": [
-              "set -e",
-              "IMAGE_URI=$FULL_IMAGE",
-              "for i in $(seq 1 30); do",
-              "  if curl -sf -o /dev/null http://localhost:$TARGET_PORT/; then echo 'Container healthy on target port'; exit 0; fi;",
-              "  sleep 5;",
-              "done",
-              "echo 'Container failed health check on target port' >&2",
-              "docker logs app || true",
-              "exit 1"
-            ]
-          }
-          SSMPARAMS
-
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
-          echo "COMMAND_ID=$COMMAND_ID"
-
+          STATUS=""
           for i in $(seq 1 60); do
-            STATUS=$(aws ssm list-command-invocations \
-              --instance-id "$INSTANCE_ID" \
+            STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
-              --query "CommandInvocations[0].Status" --output text)
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
             echo "SSM status: $STATUS"
-            if [ "$STATUS" = "Success" ]; then
-              echo "==> Remote deployment health check succeeded"
-              exit 0
-            fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              echo "==> SSM command failed with status $STATUS" >&2
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query "StandardErrorContent" --output text || true
-              exit 1
-            fi
-            sleep 10
+            case "$STATUS" in
+              Success) echo "==> SSM command succeeded"; exit 0 ;;
+              InProgress|Pending|Delayed) sleep 10 ;;
+              *) echo "==> SSM command failed with status: $STATUS"; aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" || true; exit 1 ;;
+            esac
           done
-          echo "==> Timed out waiting for SSM command" >&2
+          echo "ERROR: SSM command timed out" >&2
           exit 1
 
-  verify:
-    name: Verify Public Deployment
-    runs-on: ubuntu-latest
-    needs: deploy
-    steps:
-      - name: Health check public URL (HTTP 200 only)
+      - name: Verify deployment - health check
         run: |
           set -e
-          URL="$PUBLIC_URL"
-          echo "Probing $URL ..."
+          echo "Waiting for app at $PUBLIC_URL ..."
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/" || true)
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "==> Deployment verified: HTTP 200 from $URL"
+              echo "==> Health check passed (HTTP 200)"
               exit 0
             fi
             sleep 10
           done
-          echo "==> Deployment verification failed: no HTTP 200 from $URL" >&2
+          echo "ERROR: Health check failed; never received HTTP 200 from $PUBLIC_URL" >&2
           exit 1
 
   outputs:
-    name: Emit Deployment Outputs
+    name: Record Deployment Outputs
     runs-on: ubuntu-latest
-    needs: verify
+    needs: deploy
     steps:
-      - name: Summary of deployment targets
+      - name: Summary
         run: |
-          set -e
           {
             echo "## Deployment Summary"
             echo "- public_ip: 13.232.10.48"
@@ -250,4 +196,4 @@ jobs:
             echo "- security_group_id: sg-0cbdf45839bf94fd6"
             echo "- iam_instance_profile: blog-django-instance-profile"
             echo "- iam_role: blog-django-ec2-role"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY"
