@@ -57,7 +57,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python manage.py check
-          python manage.py makemigrations --check --dry-run || true
 
       - name: Configure AWS CLI credentials
         run: |
@@ -90,8 +89,8 @@ jobs:
           CONTAINER_PORT="$CONTAINER_PORT"
           SECRET_ID="$SECRETS_MANAGER_ID"
 
-          # The EC2 instance profile (blog-django-ec2-role) resolves the secret
-          # at runtime so no secret value transits the runner.
+          # The EC2 instance profile (blog-django-instance-profile) resolves the
+          # secret at runtime so no secret value transits the runner.
           cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
@@ -101,10 +100,10 @@ jobs:
               "docker stop app || true",
               "docker rm app || true",
               "SECRET_KEY=\$(aws secretsmanager get-secret-value --secret-id ${SECRET_ID} --region ${REGION} --query SecretString --output text)",
-              "docker run -d --restart always -p ${HOST_PORT}:${CONTAINER_PORT} -e PORT=${CONTAINER_PORT} -e SECRET_KEY=\"\$SECRET_KEY\" --name app ${IMAGE_URI}",
-              "sleep 25",
-              "docker ps --filter name=app",
-              "docker logs --tail 50 app || true"
+              "docker run -d --restart always --name app -p ${HOST_PORT}:${CONTAINER_PORT} -e SECRET_KEY=\$SECRET_KEY -e DJANGO_SETTINGS_MODULE=my_site.settings -e DEBUG=0 ${IMAGE_URI}",
+              "sleep 15",
+              "docker ps --filter name=app --format '{{.Status}}'",
+              "curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:${CONTAINER_PORT}/ || exit 1"
             ]
           }
           SSMPARAMS
@@ -113,48 +112,49 @@ jobs:
             --instance-ids "$INSTANCE_ID" \
             --region "$REGION" \
             --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
             --comment "Deploy blog-django $GITHUB_SHA" \
-            --query "Command.CommandId" \
-            --output text)
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" --output text)
           echo "SSM Command ID: $COMMAND_ID"
 
           for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation \
+            STATUS=$(aws ssm list-command-invocations \
               --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
               --region "$REGION" \
-              --query "Status" \
-              --output text)
-            echo "Attempt $i: SSM command status = $STATUS"
-            case "$STATUS" in
-              Success) exit 0 ;;
-              Failed|Cancelled|TimedOut)
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" \
-                  --instance-id "$INSTANCE_ID" \
-                  --region "$REGION" \
-                  --query "StandardErrorContent" \
-                  --output text || true
-                exit 1 ;;
-            esac
+              --query "CommandInvocations[0].Status" --output text)
+            echo "Attempt $i: $STATUS"
+            if [ "$STATUS" = "Success" ]; then break; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm list-command-invocations --command-id "$COMMAND_ID" --region "$REGION" --details --output json || true
+              exit 1
+            fi
             sleep 10
           done
-          echo "SSM command did not reach Success in time"
-          exit 1
+          if [ "$STATUS" != "Success" ]; then
+            echo "SSM command did not succeed: $STATUS"
+            exit 1
+          fi
 
-      - name: Health check
+      - name: Verify deployment output
         run: |
           set -e
-          echo "Verifying deployment at $PUBLIC_URL"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "StandardOutputContent" --output text || true
+
+      - name: Health check public URL
+        run: |
+          set -e
           for i in $(seq 1 20); do
-            HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$PUBLIC_URL" || echo "000")
-            echo "Attempt $i: HTTP $HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed with HTTP 200"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL" || echo "000")
+            echo "Attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Health check passed (HTTP 200)."
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: did not receive HTTP 200 from $PUBLIC_URL"
+          echo "Health check failed: $PUBLIC_URL did not return HTTP 200."
           exit 1
