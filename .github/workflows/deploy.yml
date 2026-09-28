@@ -43,6 +43,15 @@ jobs:
           echo "Dockerfile:"
           cat Dockerfile || true
 
+      - name: Verify AWS credentials are available
+        run: |
+          set -e
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "Missing AWS credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets)"
+            exit 1
+          fi
+          aws sts get-caller-identity
+
       - name: Login to Amazon ECR (AWS CLI, static credentials)
         run: |
           set -e
@@ -83,7 +92,8 @@ jobs:
             exit 1
           fi
 
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          # Write SSM command payload to a JSON file to avoid shell parsing bugs
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -e",
@@ -91,71 +101,46 @@ jobs:
               "docker pull $FULL_IMAGE",
               "docker stop app || true",
               "docker rm app || true",
-              "SECRET_JSON=\$(aws secretsmanager get-secret-value --region $REGION --secret-id $SECRET_ID --query SecretString --output text)",
-              "SECRET_KEY=\$(echo \"\$SECRET_JSON\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"SECRET_KEY\"])' 2>/dev/null || echo \"\$SECRET_JSON\")",
-              "docker run -d --restart always -p 80:80 --name app -e SECRET_KEY=\"\$SECRET_KEY\" $FULL_IMAGE",
-              "docker ps --filter name=app"
+              "SECRET_JSON=$(aws secretsmanager get-secret-value --region $REGION --secret-id $SECRET_ID --query SecretString --output text)",
+              "SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"SECRET_KEY\"])')",
+              "docker run -d --restart always -p 80:80 --name app -e SECRET_KEY=\"$SECRET_KEY\" -e DJANGO_SETTINGS_MODULE=my_site.settings $FULL_IMAGE",
+              "sleep 10",
+              "docker ps | grep app"
             ]
           }
           SSMPARAMS
 
-          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" \
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy $GITHUB_SHA" \
+            --comment "Deploy blog-django $GITHUB_SHA" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "SSM Command ID: $COMMAND_ID"
 
-          # Wait for the command to complete
-          for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation --region "$REGION" \
-              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text)
-            echo "Attempt $i: $STATUS"
-            case "$STATUS" in
-              Success) break ;;
-              Failed|Cancelled|TimedOut)
-                echo "SSM command failed with status: $STATUS"
-                aws ssm get-command-invocation --region "$REGION" \
-                  --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-                  --query "{StdOut:StandardOutputContent,StdErr:StandardErrorContent}" --output text || true
-                exit 1
-                ;;
-            esac
-            sleep 10
-          done
-
+          # Wait for the command to complete and fail on error
+          aws ssm wait command-executed --region "$REGION" --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID"
+          STATUS=$(aws ssm get-command-invocation --region "$REGION" --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query "Status" --output text)
+          echo "SSM command status: $STATUS"
           if [ "$STATUS" != "Success" ]; then
-            echo "SSM command did not succeed in time (final status: $STATUS)"
+            echo "Deployment command failed. Output:"
+            aws ssm get-command-invocation --region "$REGION" --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --output json || true
             exit 1
           fi
 
-          echo "SSM deployment command completed successfully."
-
-      - name: Wait for container startup
-        run: |
-          echo "Allowing migrations and gunicorn to start (start period 20s)..."
-          sleep 30
-
-      - name: Verify deployment health (HTTP 200 required)
+      - name: Wait for container to become healthy
         run: |
           set -e
-          URL="$HEALTH_URL"
-          echo "Health checking $URL"
-          OK=""
+          echo "Waiting for $HEALTH_URL to return HTTP 200..."
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/health_body.html -w "%{http_code}" --max-time 10 "$URL" || echo "000")
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || true)
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              OK="yes"
-              break
+              echo "Health check passed (HTTP 200)."
+              exit 0
             fi
             sleep 10
           done
-          if [ "$OK" != "yes" ]; then
-            echo "Health check failed: did not receive HTTP 200 from $URL"
-            echo "--- Last response body (truncated) ---"
-            head -c 2000 /tmp/health_body.html || true
-            exit 1
-          fi
-          echo "Health check passed: $URL returned HTTP 200."
+          echo "Health check failed: $HEALTH_URL did not return HTTP 200 within timeout."
+          exit 1
