@@ -63,96 +63,86 @@ jobs:
           ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
         run: |
           set -e
-          INSTANCE_ID="$INSTANCE_ID"
           REGION="$AWS_REGION"
           ECR_REGISTRY="$ECR_REGISTRY"
           REPO="$ECR_REPOSITORY"
           FULL_IMAGE="$ECR_REGISTRY/$REPO:latest"
+          INSTANCE_ID="$INSTANCE_ID"
 
           # Verify instance is running and reachable by SSM
           STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text)
           echo "Instance state: $STATE"
           [ "$STATE" = "running" ] || { echo "Instance not running"; exit 1; }
 
-          # Write commands payload to a JSON file to avoid shell parsing issues
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
-          {
-            "commands": [
-              "set -e",
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
-              "docker stop app || true",
-              "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI",
-              "docker ps --filter name=app"
-            ]
-          }
-          SSMPARAMS
+          PING=$(aws ssm describe-instance-information --region "$REGION" --instance-information-filter-list "key=InstanceIds,valueSet=$INSTANCE_ID" --query "InstanceInformationList[0].PingStatus" --output text)
+          echo "SSM ping status: $PING"
+          [ "$PING" = "Online" ] || { echo "SSM agent not online"; exit 1; }
 
-          # Export substitution values used inside the JSON payload via env
-          export REGION
-          export ECR_REGISTRY
-          export IMAGE_URI="$FULL_IMAGE"
+          # Substitute concrete values into the payload (no shell parsing issues)
+          PAYLOAD_IMAGE="$FULL_IMAGE" \
+          PAYLOAD_REGION="$REGION" \
+          PAYLOAD_REGISTRY="$ECR_REGISTRY" \
+          envsubst < /dev/null > /dev/null || true
 
-          # SSM parameters support env var interpolation only if we embed them,
-          # so generate the final payload with the concrete values:
           cat > /tmp/ssm-params.json << SSMFINAL
           {
             "commands": [
               "set -e",
               "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "docker pull $FULL_IMAGE",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI",
+              "docker run -d --restart always -p 80:80 --name app $FULL_IMAGE",
               "docker ps --filter name=app"
             ]
           }
           SSMFINAL
 
+          echo "SSM payload:"
+          cat /tmp/ssm-params.json
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "$REGION" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy $REPO from GitHub Actions" \
+            --comment "Deploy $FULL_IMAGE" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "SSM Command ID: $COMMAND_ID"
 
           # Wait for command completion
           for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "Status" --output text)
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$REGION" \
+              --query "Status" --output text)
             echo "Attempt $i: $STATUS"
-            if [ "$STATUS" = "Success" ]; then break; fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "{Stdout:StandardOutputContent,Stderr:StandardErrorContent}" --output text
-              exit 1
-            fi
+            case "$STATUS" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "{StdOut:StandardOutputContent,StdErr:StandardErrorContent}" --output text
+                exit 1 ;;
+            esac
             sleep 10
           done
-          [ "$STATUS" = "Success" ] || { echo "SSM command did not succeed"; exit 1; }
+          [ "$STATUS" = "Success" ] || { echo "SSM command did not succeed: $STATUS"; exit 1; }
 
           aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "StandardOutputContent" --output text
 
-      - name: Health check
+      - name: Verify deployment health
         run: |
           set -e
-          HEALTH_URL="$HEALTH_URL"
-          echo "Checking health at $HEALTH_URL"
+          echo "Waiting for container to start and pass health checks..."
+          sleep 30
           for i in $(seq 1 20); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || true)
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed."
+              echo "Deployment healthy: $HEALTH_URL returned 200"
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: did not receive HTTP 200 from $HEALTH_URL"
+          echo "Health check failed: $HEALTH_URL did not return HTTP 200"
           exit 1
-
-      - name: Deployment summary
-        if: success()
-        run: |
-          echo "Deployed blog-django ($GITHUB_SHA) to instance $INSTANCE_ID"
-          echo "Public URL: $HEALTH_URL"
