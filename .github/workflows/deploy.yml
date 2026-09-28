@@ -13,6 +13,7 @@ env:
   HEALTH_URL: http://13.233.80.26
   TARGET_PORT: "80"
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  SECRETS_MANAGER_ID: deptic/blog-django/secrets
   DOCKERFILE_PATH: .
 
 jobs:
@@ -37,6 +38,7 @@ jobs:
           echo "ECR repository: $ECR_REGISTRY/$ECR_REPOSITORY"
           echo "Instance: $INSTANCE_ID"
           echo "Health URL: $HEALTH_URL"
+          echo "Secrets Manager: $SECRETS_MANAGER_ID"
           echo "Git SHA: $GITHUB_SHA"
           echo "Dockerfile:"
           cat Dockerfile || true
@@ -60,6 +62,7 @@ jobs:
           set -e
           FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
           REGION="$AWS_REGION"
+          SECRET_ID="$SECRETS_MANAGER_ID"
 
           # Verify instance is running and manageable by SSM
           STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
@@ -70,14 +73,27 @@ jobs:
             exit 1
           fi
 
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          # Verify SSM ping status is Online
+          PING=$(aws ssm describe-instance-information --region "$REGION" \
+            --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+            --query "InstanceInformationList[0].PingStatus" --output text)
+          echo "SSM ping status: $PING"
+          if [ "$PING" != "Online" ]; then
+            echo "Instance $INSTANCE_ID is not reachable via SSM (status: $PING)"
+            exit 1
+          fi
+
+          cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
+              "set -e",
               "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "docker pull $FULL_IMAGE",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI",
+              "SECRET_JSON=\$(aws secretsmanager get-secret-value --region $REGION --secret-id $SECRET_ID --query SecretString --output text)",
+              "SECRET_KEY=\$(echo \"\$SECRET_JSON\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"SECRET_KEY\"])' 2>/dev/null || echo \"\$SECRET_JSON\")",
+              "docker run -d --restart always -p 80:80 --name app -e SECRET_KEY=\"\$SECRET_KEY\" $FULL_IMAGE",
               "docker ps --filter name=app"
             ]
           }
@@ -85,6 +101,7 @@ jobs:
 
           COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" \
             --document-name "AWS-RunShellScript" \
+            --comment "Deploy $GITHUB_SHA" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "SSM Command ID: $COMMAND_ID"
@@ -97,40 +114,48 @@ jobs:
             echo "Attempt $i: $STATUS"
             case "$STATUS" in
               Success) break ;;
-              Failed|Cancelled|TimedOut) exit 1 ;;
+              Failed|Cancelled|TimedOut)
+                echo "SSM command failed with status: $STATUS"
+                aws ssm get-command-invocation --region "$REGION" \
+                  --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+                  --query "{StdOut:StandardOutputContent,StdErr:StandardErrorContent}" --output text || true
+                exit 1
+                ;;
             esac
             sleep 10
           done
 
           if [ "$STATUS" != "Success" ]; then
-            echo "SSM command did not succeed: $STATUS"
+            echo "SSM command did not succeed in time (final status: $STATUS)"
             exit 1
           fi
 
-          # Export command output for diagnostics
-          aws ssm get-command-invocation --region "$REGION" \
-            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text || true
+          echo "SSM deployment command completed successfully."
 
-      - name: Health check
+      - name: Wait for container startup
+        run: |
+          echo "Allowing migrations and gunicorn to start (start period 20s)..."
+          sleep 30
+
+      - name: Verify deployment health (HTTP 200 required)
         run: |
           set -e
-          echo "Waiting for app to come up on $HEALTH_URL ..."
+          URL="$HEALTH_URL"
+          echo "Health checking $URL"
+          OK=""
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            CODE=$(curl -s -o /tmp/health_body.html -w "%{http_code}" --max-time 10 "$URL" || echo "000")
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed (HTTP 200)."
-              exit 0
+              OK="yes"
+              break
             fi
             sleep 10
           done
-          echo "Health check failed: did not receive HTTP 200 from $HEALTH_URL"
-          exit 1
-
-      - name: Deployment summary
-        run: |
-          echo "=== Deployment complete ==="
-          echo "Image: $ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
-          echo "Instance: $INSTANCE_ID"
-          echo "Public URL: $HEALTH_URL"
+          if [ "$OK" != "yes" ]; then
+            echo "Health check failed: did not receive HTTP 200 from $URL"
+            echo "--- Last response body (truncated) ---"
+            head -c 2000 /tmp/health_body.html || true
+            exit 1
+          fi
+          echo "Health check passed: $URL returned HTTP 200."
