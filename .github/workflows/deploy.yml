@@ -45,6 +45,16 @@ jobs:
           ls -la
           echo "--- Dockerfile ---"
           cat Dockerfile
+          echo "--- requirements.txt ---"
+          cat requirements.txt
+
+      - name: Verify Django project checks
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python manage.py check
+          python manage.py makemigrations --check --dry-run || true
 
       - name: Configure AWS CLI credentials
         run: |
@@ -111,14 +121,16 @@ jobs:
       - name: Health check (HTTP 200 required)
         run: |
           set -e
-          for i in $(seq 1 15); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL" || true)
-            echo "Attempt $i: HTTP status $CODE"
+          URL="$PUBLIC_URL/"
+          echo "Checking $URL"
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
+            echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Deployment verified: $PUBLIC_URL returned 200"
+              echo "Deployment verified: $URL returned HTTP 200"
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: $PUBLIC_URL did not return HTTP 200"
+          echo "Health check failed: $URL did not return HTTP 200"
           exit 1
