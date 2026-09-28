@@ -11,7 +11,7 @@ env:
   INSTANCE_ID: i-0e64f610b8f85252c
   SERVER_NAME: blog-django-server
   PUBLIC_IP: 13.202.142.37
-  TARGET_PORT: 8000
+  TARGET_PORT: 80
   DOCKERFILE_PATH: .
 
 jobs:
@@ -183,7 +183,7 @@ jobs:
           echo "==> Verifying live service health on public endpoint..."
           # Use literal env vars from workflow env (no ${ env.VAR } in job env block!)
           PROBE_HOST="$${PUBLIC_IP:-13.202.142.37}"
-          TARGET_PORT="$${TARGET_PORT:-8000}"
+          TARGET_PORT="$${TARGET_PORT:-80}"
           if [ -z "$PROBE_HOST" ] || [ "$PROBE_HOST" = "None" ]; then
             echo "==> No public IP or domain configured; skipping external HTTP probe."
             exit 0
