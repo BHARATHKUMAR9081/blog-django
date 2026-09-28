@@ -114,36 +114,40 @@ jobs:
               --region "$REGION" \
               --query "Status" --output text)
             echo "SSM status: $STATUS"
-            if [ "$STATUS" = "Success" ]; then exit 0; fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "CommandPlugins" --output text || true
-              exit 1
-            fi
+            case "$STATUS" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "$REGION" \
+                  --query "StandardErrorContent" --output text
+                exit 1 ;;
+            esac
             sleep 10
           done
-          echo "SSM command did not complete in time"
-          exit 1
 
-      - name: Health check deployment
+          FINAL_STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$REGION" \
+            --query "Status" --output text)
+          if [ "$FINAL_STATUS" != "Success" ]; then
+            echo "SSM command did not succeed: $FINAL_STATUS"
+            exit 1
+          fi
+
+      - name: Health check (HTTP 200 required)
         run: |
           set -e
-          URL="$PUBLIC_URL"
-          echo "Verifying health at $URL (expect HTTP 200)"
           for i in $(seq 1 20); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || true)
-            echo "Attempt $i: HTTP $CODE"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/" || true)
+            echo "Health check attempt $i -> HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed"
+              echo "Deployment verified: $PUBLIC_URL is healthy."
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed: did not receive HTTP 200"
+          echo "Health check failed: $PUBLIC_URL did not return HTTP 200."
           exit 1
-
-      - name: Deployment summary
-        if: always()
-        run: |
-          echo "Deployment pipeline finished for commit $GITHUB_SHA"
-          echo "Image: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
-          echo "Target: EC2 $INSTANCE_ID at $PUBLIC_URL"
